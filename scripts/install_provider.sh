@@ -20,7 +20,7 @@
 set -eu
 
 REPO_OWNER="Bluscream"
-REPO_NAME="music-assistant-downloader"
+REPO_NAME="mass-downloader-plugin"
 PROVIDER_DIR="downloader"
 
 REF="main"

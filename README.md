@@ -17,7 +17,7 @@ A custom plugin for [Music Assistant](https://github.com/music-assistant/server)
 Run the following command in a shell that has access to the host's Docker daemon (e.g., via the Advanced SSH & Web Terminal add-on with Protection Mode turned off):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Bluscream/music-assistant-downloader/main/scripts/install_provider.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Bluscream/mass-downloader-plugin/main/scripts/install_provider.sh | sh
 ```
 
 ### Options
