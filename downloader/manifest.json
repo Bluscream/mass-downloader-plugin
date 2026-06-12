@@ -1,0 +1,10 @@
+{
+  "type": "plugin",
+  "domain": "downloader",
+  "name": "Downloader",
+  "description": "Allows downloading media items from cloud providers to local filesystems.",
+  "codeowners": ["bluscream"],
+  "requirements": [
+    "mutagen==1.47.0"
+  ]
+}
