@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import urllib.parse
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import ContentType, MediaType, ProviderFeature
@@ -84,6 +85,14 @@ async def get_config_entries(
             description="Name of the playlist used as a download queue. Added tracks will be automatically downloaded and removed.",
             required=True,
         ),
+        ConfigEntry(
+            key="instant_downloads",
+            type=ConfigEntryType.BOOLEAN,
+            label="Enable Instant Downloads",
+            default_value=True,
+            description="Trigger download immediately when a song is added to the download queue. If disabled, downloads will only run on the scheduled task interval.",
+            required=True,
+        ),
     )
 
 class DownloaderPlugin(PluginProvider):
@@ -98,9 +107,29 @@ class DownloaderPlugin(PluginProvider):
         from music_assistant_models.enums import EventType
         self.mass.subscribe(self._on_mass_event, (EventType.MEDIA_ITEM_ADDED, EventType.MEDIA_ITEM_UPDATED))
         self._download_lock = asyncio.Lock()
+        self._queue_playlist_id = None
+
+        # Register recurring task to check queue playlist every hour
+        from music_assistant_models.background_task import TaskSchedule
+        self.mass.tasks.register_scheduled_task(
+            task_id=f"downloader_queue_check_{self.instance_id}",
+            name="Download queue periodic check",
+            handler=self._run_scheduled_queue_check,
+            schedule=TaskSchedule.hourly(every=1),
+        )
 
         # Create Download Queue playlist automatically if it doesn't exist
         self.mass.loop.create_task(self._create_queue_playlist_if_missing())
+
+        # Resolve ffmpeg version
+        self.ffmpeg_version = await self._resolve_ffmpeg_version()
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Handle unload/close of the provider."""
+        self.mass.tasks.unregister_scheduled_task(
+            f"downloader_queue_check_{self.instance_id}",
+            clear_persisted_state=is_removed,
+        )
 
     async def _create_queue_playlist_if_missing(self) -> None:
         """Helper to create the download queue playlist on boot if it does not exist."""
@@ -113,20 +142,34 @@ class DownloaderPlugin(PluginProvider):
             playlists = await self.mass.music.playlists.library_items()
             for playlist in playlists:
                 if playlist.name.lower() == queue_name.lower():
-                    self.logger.info("Download queue playlist '%s' already exists.", playlist.name)
+                    self.logger.info("Download queue playlist '%s' already exists. Triggering boot scan...", playlist.name)
+                    # Convert item_id to int in case it is passed as a string representation of the database ID
+                    try:
+                        db_playlist_id = int(playlist.item_id)
+                    except ValueError:
+                        db_playlist_id = playlist.item_id
+                    self._queue_playlist_id = db_playlist_id
+                    self.mass.loop.create_task(self._process_queue(db_playlist_id))
                     return
             
             # Create a new playlist on the builtin provider
             self.logger.info("Creating download queue playlist: %s", queue_name)
-            await self.mass.music.playlists.create_playlist(
+            playlist = await self.mass.music.playlists.create_playlist(
                 name=queue_name,
                 provider_instance_or_domain="builtin"
             )
+            try:
+                db_playlist_id = int(playlist.item_id)
+            except ValueError:
+                db_playlist_id = playlist.item_id
+            self._queue_playlist_id = db_playlist_id
         except Exception as e:
             self.logger.warning("Failed to auto-create download queue playlist: %s", e)
 
     async def _on_mass_event(self, event: Any) -> None:
         """Handle library events to detect additions to the Download Queue playlist."""
+        if not self.config.get_value("instant_downloads", True):
+            return
         # The object_id is the playlist URI or DB ID.
         # We check if it is a playlist and its name matches the configured queue_playlist.
         if not event.object_id or not event.object_id.startswith("library://playlist/"):
@@ -146,11 +189,46 @@ class DownloaderPlugin(PluginProvider):
         if playlist.name.lower() != queue_name.lower():
             return
 
+        self._queue_playlist_id = db_playlist_id
+        await self._process_queue(db_playlist_id)
+
+    async def _run_scheduled_queue_check(self) -> None:
+        """Scheduled task handler to check and process the download queue."""
+        queue_name = self.config.get_value("queue_playlist", "Download Queue")
+        db_playlist_id = getattr(self, "_queue_playlist_id", None)
+        
+        if db_playlist_id is None:
+            # Try to resolve playlist dynamically
+            try:
+                playlists = await self.mass.music.playlists.library_items()
+                for playlist in playlists:
+                    if playlist.name.lower() == queue_name.lower():
+                        try:
+                            db_playlist_id = int(playlist.item_id)
+                        except ValueError:
+                            db_playlist_id = playlist.item_id
+                        self._queue_playlist_id = db_playlist_id
+                        break
+            except Exception as e:
+                self.logger.warning("Failed to resolve download queue playlist in scheduled check: %s", e)
+                return
+
+        if db_playlist_id is not None:
+            await self._process_queue(db_playlist_id)
+        else:
+            self.logger.debug("Download queue playlist '%s' does not exist yet.", queue_name)
+
+    async def _process_queue(self, db_playlist_id: str | int) -> None:
+        """Process tracks in the download queue playlist."""
+        playlist = await self.mass.music.playlists.get_library_item(db_playlist_id)
+        if not playlist:
+            return
+
         # Acquire lock so we process one update at a time
         async with self._download_lock:
-            # Fetch the tracks in the playlist
+            # Fetch the tracks in the playlist with force_refresh=True to avoid cached desync
             tracks = []
-            async for track in self.mass.music.playlists.tracks(str(db_playlist_id), "library"):
+            async for track in self.mass.music.playlists.tracks(str(db_playlist_id), "library", force_refresh=True):
                 tracks.append(track)
 
             if not tracks:
@@ -160,6 +238,7 @@ class DownloaderPlugin(PluginProvider):
             
             # Download all tracks currently in the queue
             positions_to_remove = []
+            has_failures = False
             for idx, track in enumerate(tracks):
                 try:
                     # Find a source cloud provider mapping
@@ -180,22 +259,33 @@ class DownloaderPlugin(PluginProvider):
                         source_provider=prov_mapping.provider_instance,
                         target_provider=target_prov
                     )
-                    positions_to_remove.append(idx)
+                    positions_to_remove.append(idx + 1)
                 except Exception as ex:
                     self.logger.exception("Failed to auto-download queued track %s: %s", track.name, ex)
+                    has_failures = True
 
             # Remove successfully downloaded tracks from the playlist
             if positions_to_remove:
                 self.logger.info("Removing downloaded tracks at positions %s from %s", positions_to_remove, playlist.name)
-                # Music Assistant expects a tuple of positions to remove
-                await self.mass.music.playlists.remove_playlist_tracks(db_playlist_id, tuple(positions_to_remove))
+                # Use _handle_remove_playlist_tracks directly to process the removal synchronously
+                # inside our lock context, so we prevent concurrent/duplicate events from processing
+                # the same track again.
+                try:
+                    await self.mass.music.playlists._handle_remove_playlist_tracks(db_playlist_id, tuple(positions_to_remove))
+                except Exception as ex:
+                    self.logger.exception("Failed to remove downloaded tracks from playlist: %s", ex)
 
                 # Trigger local files sync
                 try:
                     target_prov = await self._find_default_target_provider("track")
-                    self.mass.music.start_sync(providers=[target_prov])
+                    await self.mass.music.start_sync(providers=[target_prov])
                 except Exception:
                     pass
+
+            # If there were failures (like providers still loading), retry in 15 seconds
+            if has_failures:
+                self.logger.info("Some tracks failed to download. Retrying queue processing in 15 seconds...")
+                self.mass.call_later(15, self._process_queue, db_playlist_id)
 
     async def download(
         self,
@@ -233,7 +323,7 @@ class DownloaderPlugin(PluginProvider):
 
             # Trigger rescan/sync on local file provider so newly added files are cataloged
             self.logger.info("Triggering rescan on local provider: %s", target_provider_instance_id)
-            self.mass.music.start_sync(providers=[target_provider_instance_id])
+            await self.mass.music.start_sync(providers=[target_provider_instance_id])
 
             return {"success": True, "message": "Download task completed successfully."}
         except Exception as e:
@@ -436,6 +526,24 @@ class DownloaderPlugin(PluginProvider):
 
         await asyncio.to_thread(save_file)
 
+        # Resolve album and other metadata in parallel
+        source_album = None
+        if track.album and track.album.name and track.album.name != "Unknown Album":
+            source_album = track.album.name
+
+        resolved_album, resolved_year, resolved_publisher, resolved_copyright = await self._resolve_metadata(
+            track, track.name, artist_name, dest_file
+        )
+
+        final_album = source_album or resolved_album
+        if not final_album:
+            if artist_name and artist_name != "Unknown Artist":
+                final_album = artist_name
+            else:
+                final_album = f"{track.name} - Single"
+
+        encoder_tag = f"ffmpeg {getattr(self, 'ffmpeg_version', 'unknown')}"
+
         # Apply metadata tags
         self.logger.info("Applying metadata tags to: %s", dest_file)
         if target_format == "flac":
@@ -444,9 +552,13 @@ class DownloaderPlugin(PluginProvider):
                 dest_file,
                 track.name,
                 artist_name,
-                album_name,
+                final_album,
                 track_number,
-                cover_bytes
+                cover_bytes,
+                resolved_year,
+                resolved_publisher,
+                resolved_copyright,
+                encoder_tag
             )
         else:
             await asyncio.to_thread(
@@ -454,9 +566,13 @@ class DownloaderPlugin(PluginProvider):
                 dest_file,
                 track.name,
                 artist_name,
-                album_name,
+                final_album,
                 track_number,
-                cover_bytes
+                cover_bytes,
+                resolved_year,
+                resolved_publisher,
+                resolved_copyright,
+                encoder_tag
             )
 
         self.logger.info("Successfully downloaded and tagged: %s", filename)
@@ -535,11 +651,15 @@ class DownloaderPlugin(PluginProvider):
         artist: str,
         album: str,
         track_number: int,
-        cover_bytes: bytes | None
+        cover_bytes: bytes | None,
+        year: str | None = None,
+        publisher: str | None = None,
+        copyright_text: str | None = None,
+        encoder: str | None = None
     ) -> None:
         """Writes ID3 tags to MP3 file using mutagen."""
         from mutagen.mp3 import MP3
-        from mutagen.id3 import ID3, APIC, TALB, TPE1, TRCK, TIT2
+        from mutagen.id3 import ID3, APIC, TALB, TPE1, TRCK, TIT2, TDRC, TPUB, TCOP, TENC
 
         audio = MP3(filepath, ID3=ID3)
         try:
@@ -551,6 +671,15 @@ class DownloaderPlugin(PluginProvider):
         audio.tags.add(TPE1(encoding=3, text=artist))
         audio.tags.add(TALB(encoding=3, text=album))
         audio.tags.add(TRCK(encoding=3, text=str(track_number)))
+
+        if year:
+            audio.tags.add(TDRC(encoding=3, text=year))
+        if publisher:
+            audio.tags.add(TPUB(encoding=3, text=publisher))
+        if copyright_text:
+            audio.tags.add(TCOP(encoding=3, text=copyright_text))
+        if encoder:
+            audio.tags.add(TENC(encoding=3, text=encoder))
 
         if cover_bytes:
             audio.tags.add(
@@ -571,7 +700,11 @@ class DownloaderPlugin(PluginProvider):
         artist: str,
         album: str,
         track_number: int,
-        cover_bytes: bytes | None
+        cover_bytes: bytes | None,
+        year: str | None = None,
+        publisher: str | None = None,
+        copyright_text: str | None = None,
+        encoder: str | None = None
     ) -> None:
         """Writes Vorbis Comments to FLAC file using mutagen."""
         from mutagen.flac import FLAC, Picture
@@ -582,6 +715,17 @@ class DownloaderPlugin(PluginProvider):
         audio["album"] = album
         audio["tracknumber"] = str(track_number)
 
+        if year:
+            audio["date"] = year
+        if publisher:
+            audio["publisher"] = publisher
+            audio["organization"] = publisher
+        if copyright_text:
+            audio["copyright"] = copyright_text
+        if encoder:
+            audio["encoded-by"] = encoder
+            audio["encoder"] = encoder
+
         if cover_bytes:
             pic = Picture()
             pic.data = cover_bytes
@@ -589,3 +733,193 @@ class DownloaderPlugin(PluginProvider):
             pic.mime = "image/jpeg"
             audio.add_picture(pic)
         audio.save()
+
+    async def _resolve_ffmpeg_version(self) -> str:
+        """Resolve the version of installed ffmpeg."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            first_line = stdout.decode("utf-8", errors="replace").splitlines()[0]
+            if "version" in first_line:
+                parts = first_line.split("version ")
+                if len(parts) > 1:
+                    return parts[1].split(" ")[0]
+        except Exception as e:
+            self.logger.warning("Failed to resolve ffmpeg version: %s", e)
+        return "unknown"
+
+    async def _resolve_metadata(
+        self, track: Any, title: str, artist: str, filepath: str
+    ) -> tuple[str | None, str | None, str | None, str | None]:
+        """Resolves metadata from AcoustID, MusicBrainz, and MASS Search in parallel."""
+        # Step 1: Get fingerprint from the file
+        duration, fingerprint = await self._get_chromaprint(filepath)
+
+        # Step 2: Query in parallel
+        tasks = []
+        if fingerprint and duration:
+            tasks.append(self._query_acoustid(duration, fingerprint))
+        else:
+            tasks.append(asyncio.sleep(0, result=None))
+
+        tasks.append(self._query_musicbrainz(title, artist))
+        tasks.append(self._query_mass_internal(title, artist))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        acoustid_res = results[0] if not isinstance(results[0], Exception) else None
+        musicbrainz_res = results[1] if not isinstance(results[1], Exception) else None
+        mass_res = results[2] if not isinstance(results[2], Exception) else None
+
+        album = None
+        year = None
+        publisher = None
+        copyright_text = None
+
+        # Step 3: Check if there is a YouTube / YouTube Music mapping to query its upload year
+        yt_year = None
+        if hasattr(track, "provider_mappings"):
+            for pm in track.provider_mappings:
+                if pm.provider_domain in ("ytmusic", "youtube"):
+                    yt_year = await self._query_youtube_year(pm.item_id)
+                    if yt_year:
+                        break
+
+        # Merge strategy: AcoustID -> MusicBrainz -> MASS Internal
+        if yt_year:
+            year = yt_year
+        if acoustid_res and acoustid_res.get("status") == "ok":
+            for res in acoustid_res.get("results", []):
+                for rec in res.get("recordings", []):
+                    for rel in rec.get("releases", []):
+                        if not album and rel.get("title"):
+                            album = rel.get("title")
+                        if not year and rel.get("date"):
+                            date_val = rel.get("date")
+                            if isinstance(date_val, dict):
+                                year = str(date_val.get("year"))
+                            elif isinstance(date_val, str):
+                                year = date_val.split("-")[0]
+                        if not publisher and rel.get("label"):
+                            publisher = rel.get("label")
+
+        if musicbrainz_res and musicbrainz_res.get("recordings"):
+            for rec in musicbrainz_res.get("recordings", []):
+                for release in rec.get("releases", []):
+                    if not album and release.get("title"):
+                        album = release.get("title")
+                    if not year and release.get("date"):
+                        date_val = release.get("date")
+                        if isinstance(date_val, str):
+                            year = date_val.split("-")[0]
+                    if not publisher and release.get("label-info"):
+                        for label_info in release.get("label-info", []):
+                            label = label_info.get("label")
+                            if label and label.get("name"):
+                                publisher = label.get("name")
+                                break
+
+        if mass_res:
+            if not album and mass_res.get("album"):
+                album = mass_res.get("album")
+            if not year and mass_res.get("year"):
+                year = str(mass_res.get("year"))
+
+        if album == "Unknown Album":
+            album = None
+
+        return album, year, publisher, copyright_text
+
+    async def _get_chromaprint(self, filepath: str) -> tuple[int, str]:
+        """Generate audio chromaprint fingerprint using fpcalc."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "fpcalc", filepath,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            duration = 0
+            fingerprint = ""
+            for line in stdout.decode("utf-8", errors="replace").splitlines():
+                if line.startswith("DURATION="):
+                    duration = int(line.split("=")[1])
+                elif line.startswith("FINGERPRINT="):
+                    fingerprint = line.split("=")[1]
+            return duration, fingerprint
+        except Exception as e:
+            self.logger.warning("fpcalc execution failed: %s", e)
+            return 0, ""
+
+    async def _query_acoustid(self, duration: int, fingerprint: str) -> dict | None:
+        """Query AcoustID API."""
+        url = f"https://api.acoustid.org/v2/lookup?client=8XaBELgH&duration={duration}&fingerprint={fingerprint}&meta=recordings+releases"
+        try:
+            async with self.mass.http_session.get(url, timeout=10) as response:
+                if response.status == 200:
+                    return await response.json()
+        except Exception as e:
+            self.logger.warning("AcoustID lookup failed: %s", e)
+        return None
+
+    async def _query_musicbrainz(self, title: str, artist: str) -> dict | None:
+        """Query MusicBrainz API."""
+        headers = {"User-Agent": "MusicAssistantDownloader/1.0 ( mailto:support@musicassistant.io )"}
+        query = urllib.parse.quote(f'recording:"{title}" AND artist:"{artist}"')
+        url = f"https://musicbrainz.org/ws/2/recording?query={query}&fmt=json"
+        try:
+            async with self.mass.http_session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    return await response.json()
+        except Exception as e:
+            self.logger.warning("MusicBrainz lookup failed: %s", e)
+        return None
+
+    async def _query_mass_internal(self, title: str, artist: str) -> dict | None:
+        """Query internal MASS music library search."""
+        try:
+            from music_assistant_models.enums import MediaType
+            query = f"{artist} - {title}"
+            results = await self.mass.music.search(query, [MediaType.TRACK], limit=5)
+            if results and results.tracks:
+                for track in results.tracks:
+                    if track.album:
+                        return {
+                            "album": track.album.name,
+                            "year": track.album.year,
+                            "mbid": track.mbid,
+                        }
+        except Exception as e:
+            self.logger.warning("MASS internal search failed: %s", e)
+        return None
+
+    async def _query_youtube_year(self, video_id: str) -> str | None:
+        """Fetch YouTube watch page and extract the upload year."""
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        }
+        try:
+            async with self.mass.http_session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    import re
+                    # Look for datePublished or uploadDate or publishDate in HTML
+                    match = re.search(r'itemprop="datePublished"\s+content="([^"]+)"', html)
+                    if not match:
+                        match = re.search(r'"uploadDate"\s*:\s*"([^"]+)"', html)
+                    if not match:
+                        match = re.search(r'"publishDate"\s*:\s*"([^"]+)"', html)
+                    
+                    if match:
+                        date_str = match.group(1)
+                        if len(date_str) >= 4 and date_str[:4].isdigit():
+                            self.logger.info("Resolved YouTube year: %s", date_str[:4])
+                            return date_str[:4]
+        except Exception as e:
+            self.logger.warning("Failed to extract YouTube year for %s: %s", video_id, e)
+        return None

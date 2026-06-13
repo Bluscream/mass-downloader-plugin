@@ -192,6 +192,12 @@ docker cp "$SRC_ROOT/$PROVIDER_DIR" "$MA_ID:$DST_DIR/" \
     || die "docker cp failed. Is the MA container running?"
 log "Provider files copied OK"
 
+# Install system dependencies
+log "Installing system dependencies (libchromaprint-tools) inside container..."
+docker exec "$MA_ID" apt-get update || true
+docker exec "$MA_ID" apt-get install -y --no-install-recommends libchromaprint-tools || true
+
+
 # --- Restart MA -------------------------------------------------------------
 
 if [ "$NO_RESTART" -ne 1 ]; then
