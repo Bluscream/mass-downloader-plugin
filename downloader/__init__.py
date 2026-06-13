@@ -117,6 +117,14 @@ async def get_config_entries(
             description="Save a separate .lrc file in the same folder next to the downloaded audio file.",
             required=True,
         ),
+        ConfigEntry(
+            key="save_srt_file",
+            type=ConfigEntryType.BOOLEAN,
+            label="Save Lyrics as SRT file next to the song",
+            default_value=False,
+            description="Save a separate .srt file in the same folder next to the downloaded audio file.",
+            required=True,
+        ),
     )
 
 class DownloaderPlugin(PluginProvider):
@@ -582,6 +590,18 @@ class DownloaderPlugin(PluginProvider):
                     lf.write(lrc_lyrics or plain_lyrics)
             await asyncio.to_thread(write_lrc)
 
+        # Write external SRT file if configured
+        save_srt_file = self.config.get_value("save_srt_file", False)
+        if save_srt_file and lrc_lyrics:
+            srt_content = self._lrc_to_srt(lrc_lyrics)
+            if srt_content:
+                srt_file_path = os.path.splitext(dest_file)[0] + ".srt"
+                self.logger.info("Saving external SRT file to: %s", srt_file_path)
+                def write_srt():
+                    with open(srt_file_path, "w", encoding="utf-8") as sf:
+                        sf.write(srt_content)
+                await asyncio.to_thread(write_srt)
+
         # Apply metadata tags
         self.logger.info("Applying metadata tags to: %s", dest_file)
         if target_format == "flac":
@@ -845,6 +865,47 @@ class DownloaderPlugin(PluginProvider):
             pic.mime = "image/jpeg"
             audio.add_picture(pic)
         audio.save()
+
+    @staticmethod
+    def _lrc_to_srt(lrc_content: str) -> str:
+        """Convert standard LRC string with [mm:ss.xx] timestamps to SubRip (.srt) format."""
+        import re
+        lrc_regex = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$")
+        events = []
+        
+        for line in lrc_content.splitlines():
+            match = lrc_regex.match(line.strip())
+            if match:
+                minutes = int(match.group(1))
+                seconds = float(match.group(2))
+                ms = int((minutes * 60 + seconds) * 1000)
+                text = match.group(3).strip()
+                events.append({"start_ms": ms, "text": text})
+                
+        if not events:
+            return ""
+            
+        events.sort(key=lambda x: x["start_ms"])
+        
+        for i in range(len(events) - 1):
+            events[i]["end_ms"] = events[i+1]["start_ms"]
+        events[-1]["end_ms"] = events[-1]["start_ms"] + 4000
+        
+        def format_srt_time(ms_val: int) -> str:
+            hours = ms_val // 3600000
+            minutes = (ms_val % 3600000) // 60000
+            seconds = (ms_val % 60000) // 1000
+            millis = ms_val % 1000
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+            
+        srt_lines = []
+        for idx, ev in enumerate(events, 1):
+            srt_lines.append(str(idx))
+            srt_lines.append(f"{format_srt_time(ev['start_ms'])} --> {format_srt_time(ev['end_ms'])}")
+            srt_lines.append(ev["text"])
+            srt_lines.append("")
+            
+        return "\n".join(srt_lines)
 
     async def _resolve_ffmpeg_version(self) -> str:
         """Resolve the version of installed ffmpeg."""
