@@ -93,6 +93,30 @@ async def get_config_entries(
             description="Trigger download immediately when a song is added to the download queue. If disabled, downloads will only run on the scheduled task interval.",
             required=True,
         ),
+        ConfigEntry(
+            key="embed_unsynced_lyrics",
+            type=ConfigEntryType.BOOLEAN,
+            label="Embed Unsynced Lyrics",
+            default_value=True,
+            description="Embed plain text unsynchronized lyrics directly inside the audio files.",
+            required=True,
+        ),
+        ConfigEntry(
+            key="embed_synced_lyrics",
+            type=ConfigEntryType.BOOLEAN,
+            label="Embed Synced Lyrics",
+            default_value=True,
+            description="Embed synchronized lyrics (SYLT in MP3, LYRICS in FLAC) directly inside the audio files.",
+            required=True,
+        ),
+        ConfigEntry(
+            key="save_lrc_file",
+            type=ConfigEntryType.BOOLEAN,
+            label="Save Lyrics as LRC file next to the song",
+            default_value=True,
+            description="Save a separate .lrc file in the same folder next to the downloaded audio file.",
+            required=True,
+        ),
     )
 
 class DownloaderPlugin(PluginProvider):
@@ -544,6 +568,20 @@ class DownloaderPlugin(PluginProvider):
 
         encoder_tag = f"ffmpeg {getattr(self, 'ffmpeg_version', 'unknown')}"
 
+        # Retrieve lyrics from metadata
+        lrc_lyrics = getattr(track.metadata, "lrc_lyrics", None)
+        plain_lyrics = getattr(track.metadata, "lyrics", None)
+
+        # Write external LRC file if configured
+        save_lrc_file = self.config.get_value("save_lrc_file", True)
+        if save_lrc_file and (lrc_lyrics or plain_lyrics):
+            lrc_file_path = os.path.splitext(dest_file)[0] + ".lrc"
+            self.logger.info("Saving external LRC file to: %s", lrc_file_path)
+            def write_lrc():
+                with open(lrc_file_path, "w", encoding="utf-8") as lf:
+                    lf.write(lrc_lyrics or plain_lyrics)
+            await asyncio.to_thread(write_lrc)
+
         # Apply metadata tags
         self.logger.info("Applying metadata tags to: %s", dest_file)
         if target_format == "flac":
@@ -558,7 +596,9 @@ class DownloaderPlugin(PluginProvider):
                 resolved_year,
                 resolved_publisher,
                 resolved_copyright,
-                encoder_tag
+                encoder_tag,
+                lrc_lyrics,
+                plain_lyrics
             )
         else:
             await asyncio.to_thread(
@@ -572,7 +612,9 @@ class DownloaderPlugin(PluginProvider):
                 resolved_year,
                 resolved_publisher,
                 resolved_copyright,
-                encoder_tag
+                encoder_tag,
+                lrc_lyrics,
+                plain_lyrics
             )
 
         self.logger.info("Successfully downloaded and tagged: %s", filename)
@@ -655,11 +697,13 @@ class DownloaderPlugin(PluginProvider):
         year: str | None = None,
         publisher: str | None = None,
         copyright_text: str | None = None,
-        encoder: str | None = None
+        encoder: str | None = None,
+        lrc_lyrics: str | None = None,
+        plain_lyrics: str | None = None
     ) -> None:
         """Writes ID3 tags to MP3 file using mutagen."""
         from mutagen.mp3 import MP3
-        from mutagen.id3 import ID3, APIC, TALB, TPE1, TRCK, TIT2, TDRC, TPUB, TCOP, TENC
+        from mutagen.id3 import ID3, APIC, TALB, TPE1, TRCK, TIT2, TDRC, TPUB, TCOP, TENC, USLT, SYLT
 
         audio = MP3(filepath, ID3=ID3)
         try:
@@ -680,6 +724,55 @@ class DownloaderPlugin(PluginProvider):
             audio.tags.add(TCOP(encoding=3, text=copyright_text))
         if encoder:
             audio.tags.add(TENC(encoding=3, text=encoder))
+
+        # Embed unsynchronized lyrics
+        embed_unsynced = self.config.get_value("embed_unsynced_lyrics", True)
+        if embed_unsynced:
+            unsynced_text = None
+            if plain_lyrics:
+                unsynced_text = plain_lyrics
+            elif lrc_lyrics:
+                import re
+                clean_text = re.sub(r'\[\d+:\d+(?:\.\d+)?\]|<[^>]+>', '', lrc_lyrics).strip()
+                clean_lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+                if clean_lines:
+                    unsynced_text = "\n".join(clean_lines)
+            
+            if unsynced_text:
+                audio.tags.add(
+                    USLT(
+                        encoding=3,
+                        lang='eng',
+                        desc='Lyrics',
+                        text=unsynced_text
+                    )
+                )
+
+        # Embed synchronized lyrics
+        embed_synced = self.config.get_value("embed_synced_lyrics", True)
+        if embed_synced and lrc_lyrics:
+            import re
+            lrc_regex = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\](.*)$")
+            sync_data = []
+            for line in lrc_lyrics.splitlines():
+                match = lrc_regex.match(line.strip())
+                if match:
+                    minutes = int(match.group(1))
+                    seconds = float(match.group(2))
+                    ms = int((minutes * 60 + seconds) * 1000)
+                    text = match.group(3).strip()
+                    sync_data.append((text, ms))
+            if sync_data:
+                audio.tags.add(
+                    SYLT(
+                        encoding=3,
+                        lang='eng',
+                        format=2,  # millisecond timestamps
+                        type=1,    # lyrics text type
+                        desc='Lyrics',
+                        text=sync_data
+                    )
+                )
 
         if cover_bytes:
             audio.tags.add(
@@ -704,7 +797,9 @@ class DownloaderPlugin(PluginProvider):
         year: str | None = None,
         publisher: str | None = None,
         copyright_text: str | None = None,
-        encoder: str | None = None
+        encoder: str | None = None,
+        lrc_lyrics: str | None = None,
+        plain_lyrics: str | None = None
     ) -> None:
         """Writes Vorbis Comments to FLAC file using mutagen."""
         from mutagen.flac import FLAC, Picture
@@ -725,6 +820,23 @@ class DownloaderPlugin(PluginProvider):
         if encoder:
             audio["encoded-by"] = encoder
             audio["encoder"] = encoder
+
+        # Embed unsynchronized lyrics
+        embed_unsynced = self.config.get_value("embed_unsynced_lyrics", True)
+        if embed_unsynced:
+            if plain_lyrics:
+                audio["unsyncedlyrics"] = plain_lyrics
+            elif lrc_lyrics:
+                import re
+                clean_text = re.sub(r'\[\d+:\d+(?:\.\d+)?\]|<[^>]+>', '', lrc_lyrics).strip()
+                clean_lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+                if clean_lines:
+                    audio["unsyncedlyrics"] = "\n".join(clean_lines)
+
+        # Embed synchronized lyrics
+        embed_synced = self.config.get_value("embed_synced_lyrics", True)
+        if embed_synced and lrc_lyrics:
+            audio["lyrics"] = lrc_lyrics
 
         if cover_bytes:
             pic = Picture()
