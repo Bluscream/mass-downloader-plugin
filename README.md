@@ -26,6 +26,56 @@ You can customize the installation by running the script with options:
 sh install_provider.sh --force --ma-id <container_name> --python-version <python_version>
 ```
 
+### Persistent Installation (Docker / Unraid)
+
+To prevent custom providers from being wiped when the Music Assistant Docker container is updated or restarted, you can use a startup hook script:
+
+1. Create a `custom_providers` directory in your persistent appdata volume (e.g., `/mnt/user/appdata/music-assistant/custom_providers/`).
+2. Place the provider folder (`downloader`) inside that directory:
+   `/mnt/user/appdata/music-assistant/custom_providers/downloader`
+3. Create an entrypoint hook script at `/mnt/user/appdata/music-assistant/entrypoint_hook.sh` with the following content:
+
+```bash
+#!/bin/sh
+
+# Find site-packages directory
+PROVIDERS_DIR=$(find /app/venv/lib/ -name "providers" -path "*/music_assistant/providers" | head -n 1)
+
+if [ -n "${PROVIDERS_DIR}" ]; then
+    # Copy custom providers from /data/custom_providers/
+    if [ -d "/data/custom_providers" ]; then
+        for provider in /data/custom_providers/*; do
+            if [ -d "$provider" ]; then
+                name=$(basename "$provider")
+                rm -rf "${PROVIDERS_DIR}/${name}"
+                cp -R "$provider" "${PROVIDERS_DIR}/${name}"
+            fi
+        done
+    fi
+
+    # Install dependencies if simplyrics is present
+    if [ -d "${PROVIDERS_DIR}/simplyrics" ]; then
+        /app/venv/bin/uv pip install ytmusicapi
+    fi
+fi
+
+# Run the original entrypoint logic
+for path in /usr/lib/*/libjemalloc.so.2; do
+    [ -f "$path" ] && export LD_PRELOAD="$path" MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000" && break
+done
+exec mass "$@"
+```
+
+4. Make the script executable:
+   ```bash
+   chmod +x /mnt/user/appdata/music-assistant/entrypoint_hook.sh
+   ```
+5. Map this hook script in your Docker/Unraid container volume config:
+   - **Host Path**: `/mnt/user/appdata/music-assistant/entrypoint_hook.sh`
+   - **Container Path**: `/usr/local/bin/entrypoint.sh`
+   - **Mode**: `Read/Write` (or `Read Only`)
+
+
 ---
 
 ## Configuration Settings
