@@ -238,36 +238,43 @@ class DownloaderPlugin(PluginProvider):
             self.logger.debug("Downloads playlist not yet initialised, skipping add for '%s'.", track_name)
             return
         try:
-            # Normalise path separators so the comparison is OS-agnostic
-            norm_dest = os.path.normpath(dest_file).lower()
+            # The filesystem provider's item_id is "artist/title", not a file path.
+            # Match by normalised track name against the original track_name.
+            norm_track_name = track_name.lower().strip()
 
-            # Search within the local provider for the track by matching its filename/path.
-            # We use a short retry loop because the sync may still be in progress.
+            # Search within the local provider for the track by name.
+            # Retry up to 6× with 10s gaps to wait for the sync to index the new file.
             local_track = None
             from music_assistant_models.enums import MediaType
             for attempt in range(6):
-                # Search by the track's basename (title without extension)
-                basename = os.path.splitext(os.path.basename(dest_file))[0]
-                results = await self.mass.music.search(basename, [MediaType.TRACK], limit=25)
+                results = await self.mass.music.search(track_name, [MediaType.TRACK], limit=25)
                 if results and results.tracks:
                     for candidate in results.tracks:
                         for pm in candidate.provider_mappings:
                             if pm.provider_instance != target_provider:
                                 continue
-                            # item_id for filesystem tracks is the URL-encoded file path
+                            # Match by candidate track name
+                            if candidate.name.lower().strip() == norm_track_name:
+                                local_track = candidate
+                                break
+                            # Fallback: item_id ends with the track name (e.g. "Various Artists/Title")
                             try:
-                                candidate_path = urllib.parse.unquote(pm.item_id)
+                                decoded_id = urllib.parse.unquote(pm.item_id)
                             except Exception:
-                                candidate_path = pm.item_id
-                            if os.path.normpath(candidate_path).lower() == norm_dest:
+                                decoded_id = pm.item_id
+                            if decoded_id.lower().strip().endswith(norm_track_name):
                                 local_track = candidate
                                 break
                         if local_track:
                             break
                 if local_track:
                     break
-                # Not found yet — wait for the sync to pick it up
+                # Not indexed yet — wait for the sync to pick it up
                 if attempt < 5:
+                    self.logger.debug(
+                        "Local track '%s' not found yet (attempt %d/6), waiting 10s...",
+                        track_name, attempt + 1
+                    )
                     await asyncio.sleep(10)
 
             if not local_track:
