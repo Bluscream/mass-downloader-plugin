@@ -125,6 +125,22 @@ async def get_config_entries(
             description="Save a separate .srt file in the same folder next to the downloaded audio file.",
             required=True,
         ),
+        ConfigEntry(
+            key="add_to_downloads_playlist",
+            type=ConfigEntryType.BOOLEAN,
+            label="Add Finished Downloads to Playlist",
+            default_value=True,
+            description="After each successful download, automatically add the local track to a 'Downloads' playlist.",
+            required=True,
+        ),
+        ConfigEntry(
+            key="downloads_playlist",
+            type=ConfigEntryType.STRING,
+            label="Downloads Playlist Name",
+            default_value="Downloads",
+            description="Name of the playlist where finished downloads are collected. Created automatically if it doesn't exist.",
+            required=True,
+        ),
     )
 
 class DownloaderPlugin(PluginProvider):
@@ -140,6 +156,7 @@ class DownloaderPlugin(PluginProvider):
         self.mass.subscribe(self._on_mass_event, (EventType.MEDIA_ITEM_ADDED, EventType.MEDIA_ITEM_UPDATED))
         self._download_lock = asyncio.Lock()
         self._queue_playlist_id = None
+        self._downloads_playlist_id = None
 
         # Register recurring task to check queue playlist every hour
         from music_assistant_models.background_task import TaskSchedule
@@ -153,6 +170,9 @@ class DownloaderPlugin(PluginProvider):
         # Create Download Queue playlist automatically if it doesn't exist
         self.mass.loop.create_task(self._create_queue_playlist_if_missing())
 
+        # Create Downloads (finished) playlist automatically if enabled
+        self.mass.loop.create_task(self._ensure_downloads_playlist())
+
         # Resolve ffmpeg version
         self.ffmpeg_version = await self._resolve_ffmpeg_version()
 
@@ -162,6 +182,108 @@ class DownloaderPlugin(PluginProvider):
             f"downloader_queue_check_{self.instance_id}",
             clear_persisted_state=is_removed,
         )
+
+    async def _ensure_downloads_playlist(self) -> None:
+        """Create (or resolve) the Downloads playlist on boot if the feature is enabled."""
+        if not self.config.get_value("add_to_downloads_playlist", True):
+            return
+        # Allow the server to load fully
+        await asyncio.sleep(5)
+        playlist_name = self.config.get_value("downloads_playlist", "Downloads")
+        try:
+            playlists = await self.mass.music.playlists.library_items()
+            for playlist in playlists:
+                if playlist.name.lower() == playlist_name.lower():
+                    self.logger.info("Downloads playlist '%s' already exists.", playlist.name)
+                    try:
+                        self._downloads_playlist_id = int(playlist.item_id)
+                    except ValueError:
+                        self._downloads_playlist_id = playlist.item_id
+                    return
+            # Create it on the builtin provider
+            self.logger.info("Creating Downloads playlist: %s", playlist_name)
+            playlist = await self.mass.music.playlists.create_playlist(
+                name=playlist_name,
+                provider_instance_or_domain="builtin"
+            )
+            try:
+                self._downloads_playlist_id = int(playlist.item_id)
+            except ValueError:
+                self._downloads_playlist_id = playlist.item_id
+        except Exception as e:
+            self.logger.warning("Failed to auto-create Downloads playlist: %s", e)
+
+    async def _add_track_to_downloads_playlist(
+        self,
+        dest_file: str,
+        target_provider: str,
+        track_name: str,
+    ) -> None:
+        """Find the local track by file path and add it to the Downloads playlist."""
+        if not self.config.get_value("add_to_downloads_playlist", True):
+            return
+        if self._downloads_playlist_id is None:
+            self.logger.debug("Downloads playlist not yet initialised, skipping add for '%s'.", track_name)
+            return
+        try:
+            # Normalise path separators so the comparison is OS-agnostic
+            norm_dest = os.path.normpath(dest_file).lower()
+
+            # Search within the local provider for the track by matching its filename/path.
+            # We use a short retry loop because the sync may still be in progress.
+            local_track = None
+            from music_assistant_models.enums import MediaType
+            for attempt in range(6):
+                # Search by the track's basename (title without extension)
+                basename = os.path.splitext(os.path.basename(dest_file))[0]
+                results = await self.mass.music.search(basename, [MediaType.TRACK], limit=25)
+                if results and results.tracks:
+                    for candidate in results.tracks:
+                        for pm in candidate.provider_mappings:
+                            if pm.provider_instance != target_provider:
+                                continue
+                            # item_id for filesystem tracks is the URL-encoded file path
+                            try:
+                                candidate_path = urllib.parse.unquote(pm.item_id)
+                            except Exception:
+                                candidate_path = pm.item_id
+                            if os.path.normpath(candidate_path).lower() == norm_dest:
+                                local_track = candidate
+                                break
+                        if local_track:
+                            break
+                if local_track:
+                    break
+                # Not found yet — wait for the sync to pick it up
+                if attempt < 5:
+                    await asyncio.sleep(10)
+
+            if not local_track:
+                self.logger.warning(
+                    "Could not find local track '%s' in provider '%s' to add to Downloads playlist.",
+                    track_name, target_provider
+                )
+                return
+
+            # Resolve the media-item URI expected by add_playlist_tracks
+            local_mapping = next(
+                (pm for pm in local_track.provider_mappings if pm.provider_instance == target_provider),
+                next(iter(local_track.provider_mappings), None)
+            )
+            if not local_mapping:
+                return
+
+            await self.mass.music.playlists.add_playlist_tracks(
+                str(self._downloads_playlist_id),
+                "library",
+                [local_track.uri],
+            )
+            self.logger.info(
+                "Added '%s' to Downloads playlist (playlist_id=%s).",
+                track_name, self._downloads_playlist_id
+            )
+        except Exception as e:
+            self.logger.warning("Failed to add track '%s' to Downloads playlist: %s", track_name, e)
 
     async def _create_queue_playlist_if_missing(self) -> None:
         """Helper to create the download queue playlist on boot if it does not exist."""
@@ -638,6 +760,11 @@ class DownloaderPlugin(PluginProvider):
             )
 
         self.logger.info("Successfully downloaded and tagged: %s", filename)
+
+        # Add to Downloads playlist after tagging is complete (non-blocking)
+        self.mass.loop.create_task(
+            self._add_track_to_downloads_playlist(dest_file, target_provider, track.name)
+        )
 
     async def _download_album(
         self,
