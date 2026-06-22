@@ -273,14 +273,46 @@ class DownloaderPlugin(PluginProvider):
             if not local_mapping:
                 return
 
-            await self.mass.music.playlists.add_playlist_tracks(
-                str(self._downloads_playlist_id),
-                "library",
-                [local_track.uri],
+            playlist_id = str(self._downloads_playlist_id)
+
+            # Collect existing track URIs so we can prepend the new one (newest-first ordering).
+            existing_uris: list[str] = []
+            existing_positions: list[int] = []
+            try:
+                pos = 1
+                async for t in self.mass.music.playlists.tracks(playlist_id, "library", force_refresh=True):
+                    existing_uris.append(t.uri)
+                    existing_positions.append(pos)
+                    pos += 1
+            except Exception as ex:
+                self.logger.warning("Could not read existing Downloads playlist tracks: %s", ex)
+
+            new_uri = local_track.uri
+
+            # Skip adding if already present (de-duplicate)
+            if new_uri in existing_uris:
+                self.logger.info("'%s' is already in the Downloads playlist, skipping.", track_name)
+                return
+
+            # Remove all existing tracks so we can re-insert in the desired order
+            if existing_positions:
+                try:
+                    await self.mass.music.playlists._handle_remove_playlist_tracks(
+                        self._downloads_playlist_id, tuple(existing_positions)
+                    )
+                except Exception as ex:
+                    self.logger.warning("Could not clear Downloads playlist for reorder: %s", ex)
+                    # Fall back to plain append
+                    existing_uris = []
+
+            # Re-add: new track first, then the rest in their original order
+            ordered_uris = [new_uri] + existing_uris
+            await self.mass.music.playlists._handle_add_playlist_tracks(
+                self._downloads_playlist_id, ordered_uris
             )
             self.logger.info(
-                "Added '%s' to Downloads playlist (playlist_id=%s).",
-                track_name, self._downloads_playlist_id
+                "Prepended '%s' to Downloads playlist (playlist_id=%s, total=%d tracks).",
+                track_name, self._downloads_playlist_id, len(ordered_uris)
             )
         except Exception as e:
             self.logger.warning("Failed to add track '%s' to Downloads playlist: %s", track_name, e)
