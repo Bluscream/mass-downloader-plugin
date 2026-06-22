@@ -141,6 +141,18 @@ async def get_config_entries(
             description="Name of the playlist where finished downloads are collected. Created automatically if it doesn't exist.",
             required=True,
         ),
+        ConfigEntry(
+            key="downloads_playlist_order",
+            type=ConfigEntryType.STRING,
+            label="Downloads Playlist Order",
+            default_value="newest_first",
+            options=[
+                ConfigValueOption("Newest First", "newest_first"),
+                ConfigValueOption("Oldest First", "oldest_first"),
+            ],
+            description="Whether new downloads are added at the top (newest first) or the bottom (oldest first) of the Downloads playlist.",
+            required=True,
+        ),
     )
 
 class DownloaderPlugin(PluginProvider):
@@ -294,8 +306,10 @@ class DownloaderPlugin(PluginProvider):
                 self.logger.info("'%s' is already in the Downloads playlist, skipping.", track_name)
                 return
 
-            # Remove all existing tracks so we can re-insert in the desired order
-            if existing_positions:
+            newest_first = self.config.get_value("downloads_playlist_order", "newest_first") == "newest_first"
+
+            if newest_first and existing_positions:
+                # Remove all existing tracks so we can re-insert with new one at the top
                 try:
                     await self.mass.music.playlists._handle_remove_playlist_tracks(
                         self._downloads_playlist_id, tuple(existing_positions)
@@ -304,16 +318,27 @@ class DownloaderPlugin(PluginProvider):
                     self.logger.warning("Could not clear Downloads playlist for reorder: %s", ex)
                     # Fall back to plain append
                     existing_uris = []
+                    newest_first = False
 
-            # Re-add: new track first, then the rest in their original order
-            ordered_uris = [new_uri] + existing_uris
-            await self.mass.music.playlists._handle_add_playlist_tracks(
-                self._downloads_playlist_id, ordered_uris
-            )
-            self.logger.info(
-                "Prepended '%s' to Downloads playlist (playlist_id=%s, total=%d tracks).",
-                track_name, self._downloads_playlist_id, len(ordered_uris)
-            )
+            if newest_first:
+                # New track first, then the rest in their original order
+                ordered_uris = [new_uri] + existing_uris
+                await self.mass.music.playlists._handle_add_playlist_tracks(
+                    self._downloads_playlist_id, ordered_uris
+                )
+                self.logger.info(
+                    "Prepended '%s' to Downloads playlist (playlist_id=%s, total=%d tracks).",
+                    track_name, self._downloads_playlist_id, len(ordered_uris)
+                )
+            else:
+                # Simple append to end
+                await self.mass.music.playlists._handle_add_playlist_tracks(
+                    self._downloads_playlist_id, [new_uri]
+                )
+                self.logger.info(
+                    "Appended '%s' to Downloads playlist (playlist_id=%s).",
+                    track_name, self._downloads_playlist_id
+                )
         except Exception as e:
             self.logger.warning("Failed to add track '%s' to Downloads playlist: %s", track_name, e)
 
